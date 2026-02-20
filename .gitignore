@@ -1,0 +1,16 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+
+data/
+assets/
+outputs/
+outputs_paper/
+outputs_smoke/
+outputs_smoke2/
+outputs_smoke3/
+outputs_smoke_daily/
+outputs_smoke_full/
+
+Novo Documento de Texto.txt

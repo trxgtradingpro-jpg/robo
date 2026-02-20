@@ -1,0 +1,6 @@
+﻿pandas
+numpy
+matplotlib
+streamlit
+plotly
+pytest
