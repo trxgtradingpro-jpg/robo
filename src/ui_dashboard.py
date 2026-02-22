@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import time as time_mod
@@ -32,6 +33,7 @@ from src.data_loader import (
 from src.metrics import ScoreConfig
 from src.optimizer import OptimizerConfig
 from src.reports import (
+    build_hourly_report,
     build_monthly_report,
     build_parameter_sensitivity_report,
     build_robustness_report,
@@ -62,6 +64,7 @@ class DashboardRunResult:
     start: pd.Timestamp
     end: pd.Timestamp
     base_cfg: BacktestConfig
+    outputs_root: str
 
 
 @dataclass(slots=True)
@@ -71,6 +74,7 @@ class TurboJob:
     process: Any
     command: list[str]
     log_file: str
+    stop_file: str
     symbol: str
     timeframes: list[str]
     strategies: list[str]
@@ -78,6 +82,25 @@ class TurboJob:
     start_iso: str
     end_iso: str
     base_cfg_dict: dict[str, Any]
+
+
+SCORE_PRESETS: dict[str, dict[str, float | int]] = {
+    "conservador": {
+        "drawdown_weight": 2.4,
+        "min_trades": 35,
+        "penalty_missing": 220.0,
+    },
+    "equilibrado": {
+        "drawdown_weight": 1.5,
+        "min_trades": 20,
+        "penalty_missing": 150.0,
+    },
+    "agressivo": {
+        "drawdown_weight": 0.9,
+        "min_trades": 8,
+        "penalty_missing": 70.0,
+    },
+}
 
 
 def main() -> None:
@@ -105,15 +128,21 @@ def main() -> None:
                 "Timeframes",
                 options=timeframe_options,
                 default=st.session_state.timeframes_default,
+                key="ui_selected_timeframes",
             )
             strategies = st.multiselect(
                 "Estrategias",
                 options=list(STRATEGIES.keys()),
                 default=st.session_state.strategies_default,
+                key="ui_selected_strategies",
             )
-            execution_mode = st.radio("Modo", options=["OHLC", "Tick a Tick (desativado)"], index=0)
-            if execution_mode.startswith("Tick"):
-                st.warning("Tick a Tick ainda nao implementado. O modo OHLC sera utilizado.")
+            execution_mode = st.radio("Modo", options=["OHLC", "Tick a Tick"], index=0)
+            tick_data_root = st.text_input(
+                "Pasta Tick a Tick",
+                value="assets/dados-historicos-winfut/tik-a-tik",
+                disabled=not execution_mode.startswith("Tick"),
+            )
+            load_validated_positive = st.button("Usar validadas + positivas", use_container_width=True)
             start_date = st.date_input("Inicio", value=st.session_state.start_date_default)
             end_date = st.date_input("Fim", value=st.session_state.end_date_default)
             c1, c2 = st.columns(2)
@@ -127,11 +156,54 @@ def main() -> None:
             with c1:
                 train_days = st.number_input("Train", min_value=20, max_value=500, value=120, step=5)
                 samples = st.number_input("Samples", min_value=5, max_value=3000, value=200, step=5)
-                drawdown_weight = st.number_input("Peso DD", min_value=0.0, max_value=20.0, value=1.5, step=0.1)
+                max_stop_points = st.number_input("Stop max (pts)", min_value=0.0, max_value=5000.0, value=0.0, step=10.0)
+                max_daily_loss = st.number_input("Perda diaria max (R$)", min_value=0.0, max_value=1_000_000.0, value=0.0, step=100.0)
             with c2:
                 test_days = st.number_input("Test", min_value=5, max_value=250, value=30, step=5)
                 top_k = st.number_input("Top K", min_value=1, max_value=50, value=5, step=1)
-                min_trades = st.number_input("Min trades", min_value=0, max_value=1000, value=20, step=1)
+                max_drawdown_pct_hard = st.number_input("DD max hard (%)", min_value=0.0, max_value=100.0, value=0.0, step=0.5)
+                optimize_hours = st.checkbox("Otimizar horario", value=True)
+                h1, h2 = st.columns(2)
+                with h1:
+                    hour_start_min = st.number_input("Hora ini min", min_value=0, max_value=23, value=9, step=1)
+                    hour_end_min = st.number_input("Hora fim min", min_value=0, max_value=23, value=10, step=1)
+                with h2:
+                    hour_start_max = st.number_input("Hora ini max", min_value=0, max_value=23, value=16, step=1)
+                    hour_end_max = st.number_input("Hora fim max", min_value=0, max_value=23, value=18, step=1)
+
+        with st.expander("Score", expanded=False):
+            p1, p2, p3 = st.columns(3)
+            if p1.button("Conservador", use_container_width=True, key="score_preset_conservador_btn"):
+                _apply_score_preset("conservador")
+            if p2.button("Equilibrado", use_container_width=True, key="score_preset_equilibrado_btn"):
+                _apply_score_preset("equilibrado")
+            if p3.button("Agressivo", use_container_width=True, key="score_preset_agressivo_btn"):
+                _apply_score_preset("agressivo")
+            drawdown_weight = st.number_input(
+                "Peso DD",
+                min_value=0.0,
+                max_value=20.0,
+                value=1.5,
+                step=0.1,
+                key="score_drawdown_weight",
+            )
+            min_trades = st.number_input(
+                "Min trades",
+                min_value=0,
+                max_value=1000,
+                value=20,
+                step=1,
+                key="score_min_trades",
+            )
+            penalty_missing = st.number_input(
+                "Penalidade trade faltante",
+                min_value=0.0,
+                max_value=5000.0,
+                value=150.0,
+                step=10.0,
+                key="score_penalty_missing",
+            )
+            st.caption("Score = lucro liquido - (peso_dd * drawdown) - (trades_faltantes * penalidade).")
 
         with st.expander("Risco", expanded=False):
             c1, c2 = st.columns(2)
@@ -139,7 +211,6 @@ def main() -> None:
                 initial_capital = st.number_input("Capital", min_value=1000.0, max_value=50_000_000.0, value=100_000.0, step=1000.0)
                 point_value = st.number_input("Valor ponto", min_value=0.01, max_value=100.0, value=0.2, step=0.01)
             with c2:
-                penalty_missing = st.number_input("Penalidade", min_value=0.0, max_value=5000.0, value=150.0, step=10.0)
                 seed = st.number_input("Seed", min_value=0, max_value=999_999, value=42, step=1)
 
         with st.expander("Custos", expanded=False):
@@ -175,17 +246,82 @@ def main() -> None:
             turbo_log_every = st.slider("Turbo log N samples", min_value=1, max_value=100, value=10)
             turbo_refresh_sec = st.slider("Turbo refresh (s)", min_value=1, max_value=10, value=2)
             turbo_skip_plots = st.checkbox("Turbo sem PNG", value=True)
+            turbo_loop_enabled = st.checkbox("Loop turbo continuo", value=st.session_state.turbo_loop_enabled)
+            turbo_loop_pause_sec = st.slider(
+                "Loop pausa (s)",
+                min_value=1,
+                max_value=60,
+                value=int(st.session_state.turbo_loop_pause_sec),
+            )
+            turbo_loop_max_cycles = st.number_input(
+                "Loop max ciclos (0=infinito)",
+                min_value=0,
+                max_value=100_000,
+                value=int(st.session_state.turbo_loop_max_cycles),
+                step=1,
+            )
             save_outputs = st.checkbox("Salvar CSV/JSON/PNG", value=True)
-            outputs_dir = st.text_input("Pasta outputs", value="outputs")
+            outputs_dir = st.text_input("Pasta outputs", value="outputs_master")
             data_root = st.text_input("Pasta data", value="data")
 
         run_clicked = st.button("Executar", type="primary", use_container_width=True)
+        run_max_clicked = st.button("Executar MAX 24h", use_container_width=True)
         stop_clicked = st.button("Parar turbo", use_container_width=True)
+
+    selected_timeframes = list(st.session_state.get("ui_selected_timeframes", selected_timeframes))
+    strategies = list(st.session_state.get("ui_selected_strategies", strategies))
+
+    if load_validated_positive:
+        positive_strategies = _load_validated_positive_strategies(
+            outputs_root=Path(outputs_dir),
+            symbol=symbol.strip() or "WINFUT",
+            selected_timeframes=selected_timeframes,
+        )
+        if positive_strategies:
+            st.session_state.ui_selected_strategies = positive_strategies
+            strategies = positive_strategies
+            st.success(f"Estrategias carregadas: {', '.join(positive_strategies)}")
+            st.rerun()
+        else:
+            st.warning("Nenhuma estrategia validada+positiva encontrada para os timeframes selecionados.")
 
     if stop_clicked:
         _stop_turbo_job()
 
-    if run_clicked:
+    if run_clicked or run_max_clicked:
+        if run_max_clicked:
+            turbo_mode = True
+            live_updates = False
+            fast_mode = True
+            update_every = 50
+            turbo_train_step = 2
+            turbo_log_every = 25
+            turbo_skip_plots = True
+            turbo_loop_enabled = True
+            turbo_loop_pause_sec = 15
+            turbo_loop_max_cycles = 0
+            save_outputs = True
+
+            train_days = 120
+            test_days = 30
+            samples = 500
+            top_k = 12
+            drawdown_weight = 1.8
+            min_trades = 25
+            max_stop_points = 350.0
+            max_daily_loss = 1500.0
+            max_drawdown_pct_hard = 12.0
+            optimize_hours = True
+            hour_start_min = 9
+            hour_start_max = 16
+            hour_end_min = 10
+            hour_end_max = 18
+
+            if not selected_timeframes:
+                selected_timeframes = ["5m"]
+            if not strategies:
+                strategies = list(STRATEGIES.keys())
+
         error = _validate_inputs(selected_timeframes=selected_timeframes, strategies=strategies, start_date=start_date, end_date=end_date)
         if error:
             st.error(error)
@@ -206,6 +342,9 @@ def main() -> None:
                 open_auction_cost_multiplier=float(open_auction_cost_multiplier),
                 max_positions=int(max_positions),
                 entry_mode=entry_model,
+                execution_mode="tick" if execution_mode.startswith("Tick") else "ohlc",
+                tick_data_root=(tick_data_root.strip() or None) if execution_mode.startswith("Tick") else None,
+                tick_symbol=symbol.strip() or "WINFUT",
                 session_start=session_start.strip() or None,
                 session_end=session_end.strip() or None,
                 close_on_session_end=close_on_session_end,
@@ -220,6 +359,14 @@ def main() -> None:
                     min_trade_count=int(min_trades),
                     penalty_per_missing_trade=float(penalty_missing),
                 ),
+                max_stop_points=float(max_stop_points),
+                max_daily_loss=float(max_daily_loss),
+                max_drawdown_pct_hard=float(max_drawdown_pct_hard),
+                optimize_hours=bool(optimize_hours),
+                hour_start_min=int(hour_start_min),
+                hour_start_max=int(hour_start_max),
+                hour_end_min=int(hour_end_min),
+                hour_end_max=int(hour_end_max),
             )
             wf_cfg = WalkForwardConfig(
                 train_days=int(train_days),
@@ -234,6 +381,10 @@ def main() -> None:
                 if _turbo_job_running():
                     st.warning("Ja existe uma execucao turbo em andamento.")
                 else:
+                    st.session_state.turbo_loop_enabled = bool(turbo_loop_enabled)
+                    st.session_state.turbo_loop_pause_sec = int(turbo_loop_pause_sec)
+                    st.session_state.turbo_loop_max_cycles = int(turbo_loop_max_cycles)
+                    st.session_state.turbo_loop_cycles_done = 0
                     if not save_outputs:
                         st.warning("Modo turbo requer salvar outputs; opcao foi forcada para ON.")
                     _start_turbo_job(
@@ -295,6 +446,58 @@ def _validate_inputs(
     return None
 
 
+def _load_validated_positive_strategies(
+    outputs_root: Path,
+    symbol: str,
+    selected_timeframes: list[str],
+) -> list[str]:
+    valid_names = set(STRATEGIES.keys())
+    base = outputs_root / symbol
+    if not base.exists():
+        return []
+
+    if selected_timeframes:
+        normalized_tfs = [normalize_timeframe_label(tf) for tf in selected_timeframes]
+    else:
+        normalized_tfs = [p.name for p in base.iterdir() if p.is_dir()]
+
+    picks: set[str] = set()
+    for tf in normalized_tfs:
+        tf_dir = base / tf
+        if not tf_dir.exists():
+            continue
+
+        history_file = tf_dir / f"best_history_{tf}.csv"
+        if history_file.exists():
+            try:
+                hist = pd.read_csv(history_file)
+            except Exception:
+                hist = pd.DataFrame()
+            if not hist.empty and {"best_strategy", "best_net_profit"}.issubset(hist.columns):
+                local = hist.copy()
+                local["best_net_profit"] = pd.to_numeric(local["best_net_profit"], errors="coerce")
+                local = local[local["best_net_profit"] > 0]
+                for name in local["best_strategy"].dropna().astype(str):
+                    if name in valid_names:
+                        picks.add(name)
+
+        summary_file = tf_dir / f"summary_{tf}.csv"
+        if summary_file.exists():
+            try:
+                summary_df = pd.read_csv(summary_file)
+            except Exception:
+                summary_df = pd.DataFrame()
+            if not summary_df.empty and {"strategy", "net_profit"}.issubset(summary_df.columns):
+                local = summary_df.copy()
+                local["net_profit"] = pd.to_numeric(local["net_profit"], errors="coerce")
+                local = local[local["net_profit"] > 0]
+                for name in local["strategy"].dropna().astype(str):
+                    if name in valid_names:
+                        picks.add(name)
+
+    return sorted(picks)
+
+
 def _turbo_job_running() -> bool:
     job = st.session_state.get("turbo_job")
     if job is None:
@@ -323,6 +526,9 @@ def _start_turbo_job(
     log_dir = outputs_root / symbol / "_turbo_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"{run_id}.log"
+    stop_file = log_dir / f"{run_id}.stop"
+    if stop_file.exists():
+        stop_file.unlink(missing_ok=True)
 
     cmd = [
         sys.executable,
@@ -342,6 +548,8 @@ def _start_turbo_job(
         str(data_root),
         "--outputs",
         str(outputs_root),
+        "--stop-file",
+        str(stop_file),
         "--train-days",
         str(int(wf_cfg.train_days)),
         "--test-days",
@@ -352,6 +560,12 @@ def _start_turbo_job(
         str(int(optimizer_cfg.top_k)),
         "--seed",
         str(int(optimizer_cfg.random_seed)),
+        "--max-stop-points",
+        str(float(max(0.0, optimizer_cfg.max_stop_points))),
+        "--max-daily-loss",
+        str(float(max(0.0, optimizer_cfg.max_daily_loss))),
+        "--max-drawdown-pct-hard",
+        str(float(max(0.0, optimizer_cfg.max_drawdown_pct_hard))),
         "--train-bar-step",
         str(int(max(1, train_bar_step))),
         "--initial-capital",
@@ -394,10 +608,27 @@ def _start_turbo_job(
         "--progress-print-every",
         str(int(max(1, progress_print_every))),
     ]
+    if optimizer_cfg.optimize_hours:
+        cmd.extend(
+            [
+                "--optimize-hours",
+                "--hour-start-min",
+                str(int(optimizer_cfg.hour_start_min)),
+                "--hour-start-max",
+                str(int(optimizer_cfg.hour_start_max)),
+                "--hour-end-min",
+                str(int(optimizer_cfg.hour_end_min)),
+                "--hour-end-max",
+                str(int(optimizer_cfg.hour_end_max)),
+            ]
+        )
     if base_bt_cfg.session_start:
         cmd.extend(["--session-start", str(base_bt_cfg.session_start)])
     if base_bt_cfg.session_end:
         cmd.extend(["--session-end", str(base_bt_cfg.session_end)])
+    cmd.extend(["--execution-mode", str(base_bt_cfg.execution_mode)])
+    if str(base_bt_cfg.execution_mode) == "tick" and base_bt_cfg.tick_data_root:
+        cmd.extend(["--tick-data-root", str(base_bt_cfg.tick_data_root)])
     if base_bt_cfg.close_on_session_end:
         cmd.append("--close-on-session-end")
     else:
@@ -420,6 +651,7 @@ def _start_turbo_job(
         process=process,
         command=cmd,
         log_file=str(log_file),
+        stop_file=str(stop_file),
         symbol=symbol,
         timeframes=list(raw_timeframes),
         strategies=list(strategy_names),
@@ -431,13 +663,61 @@ def _start_turbo_job(
     st.success(f"Turbo iniciado (PID {process.pid}).")
 
 
+def _restart_turbo_job(previous_job: TurboJob) -> None:
+    outputs_root = Path(previous_job.outputs_dir).resolve()
+    run_id = build_run_id(prefix="turbo_ui")
+    log_dir = outputs_root / previous_job.symbol / "_turbo_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"{run_id}.log"
+    stop_file = log_dir / f"{run_id}.stop"
+    if stop_file.exists():
+        stop_file.unlink(missing_ok=True)
+    cmd = list(previous_job.command)
+    if "--stop-file" in cmd:
+        idx = cmd.index("--stop-file")
+        if idx + 1 < len(cmd):
+            cmd[idx + 1] = str(stop_file)
+    else:
+        cmd.extend(["--stop-file", str(stop_file)])
+    log_handle = open(log_file, "w", encoding="utf-8")
+    process = subprocess.Popen(
+        cmd,
+        cwd=str(PROJECT_ROOT),
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    log_handle.close()
+    st.session_state.turbo_job = TurboJob(
+        process=process,
+        command=cmd,
+        log_file=str(log_file),
+        stop_file=str(stop_file),
+        symbol=previous_job.symbol,
+        timeframes=list(previous_job.timeframes),
+        strategies=list(previous_job.strategies),
+        outputs_dir=previous_job.outputs_dir,
+        start_iso=previous_job.start_iso,
+        end_iso=previous_job.end_iso,
+        base_cfg_dict=dict(previous_job.base_cfg_dict),
+    )
+    st.success(f"Novo ciclo turbo iniciado (PID {process.pid}).")
+
+
 def _stop_turbo_job() -> None:
     job = st.session_state.get("turbo_job")
+    st.session_state.turbo_loop_enabled = False
     if job is None:
         return
     if job.process.poll() is None:
+        stop_path = Path(job.stop_file)
+        if not stop_path.exists():
+            stop_path.write_text("stop", encoding="utf-8")
+            st.warning("Parada graciosa solicitada. Clique novamente para forcar encerramento.")
+            return
         job.process.terminate()
-        st.warning("Sinal de parada enviado ao processo turbo.")
+        st.warning("Processo turbo encerrado a forca.")
     else:
         st.info("Nao ha processo turbo em execucao.")
 
@@ -450,10 +730,19 @@ def _render_turbo_status(refresh_seconds: int) -> None:
     running = job.process.poll() is None
     st.markdown("### Modo Turbo")
     st.caption(f"PID {job.process.pid} | log: `{job.log_file}`")
+    if Path(job.stop_file).exists() and running:
+        st.caption("Parada solicitada: aguardando processo finalizar checkpoint atual.")
+    if st.session_state.turbo_loop_enabled:
+        max_cycles = int(st.session_state.turbo_loop_max_cycles)
+        done = int(st.session_state.turbo_loop_cycles_done)
+        target = "infinito" if max_cycles <= 0 else str(max_cycles)
+        st.caption(f"Loop ativo: ciclo {done}/{target}")
     st.code(" ".join(job.command), language="bash")
     tail = _tail_text_file(Path(job.log_file), max_lines=40)
     if tail:
         st.code(tail, language="text")
+    live_board = _build_turbo_live_board(job)
+    _render_live_board(st, live_board, title="Ranking em Tempo Real (turbo)")
 
     if running:
         st.info("Execucao turbo em andamento...")
@@ -463,6 +752,11 @@ def _render_turbo_status(refresh_seconds: int) -> None:
 
     exit_code = int(job.process.poll() or 0)
     if exit_code != 0:
+        if _schedule_next_turbo_cycle(
+            job=job,
+            info_message=f"Ciclo finalizou com erro (exit code {exit_code}). Tentando proximo ciclo...",
+        ):
+            return
         st.error(f"Turbo finalizou com erro (exit code {exit_code}).")
         st.session_state.turbo_job = None
         return
@@ -470,13 +764,45 @@ def _render_turbo_status(refresh_seconds: int) -> None:
     try:
         result = _load_dashboard_result_from_outputs(job)
     except Exception as exc:  # pragma: no cover
+        if _schedule_next_turbo_cycle(
+            job=job,
+            info_message=f"Turbo finalizado, mas sem output valido ({exc}). Reiniciando proximo ciclo...",
+        ):
+            return
         st.error(f"Turbo finalizado, mas falhou ao carregar resultados: {exc}")
         st.session_state.turbo_job = None
         return
 
     st.success("Turbo finalizado com sucesso.")
     st.session_state.last_result = result
+    if _schedule_next_turbo_cycle(job=job, info_message=None):
+        return
     st.session_state.turbo_job = None
+
+
+def _schedule_next_turbo_cycle(job: TurboJob, info_message: str | None) -> bool:
+    """Restart turbo job when loop mode is enabled.
+
+    Returns True when flow was handled (either restarted or stopped on loop limit).
+    """
+    if not bool(st.session_state.turbo_loop_enabled):
+        return False
+    st.session_state.turbo_loop_cycles_done = int(st.session_state.turbo_loop_cycles_done) + 1
+    max_cycles = int(st.session_state.turbo_loop_max_cycles)
+    done = int(st.session_state.turbo_loop_cycles_done)
+    if max_cycles > 0 and done >= max_cycles:
+        st.info(f"Loop finalizado no limite configurado ({done}/{max_cycles}).")
+        st.session_state.turbo_loop_enabled = False
+        st.session_state.turbo_job = None
+        return True
+    pause_sec = max(1, int(st.session_state.turbo_loop_pause_sec))
+    if info_message:
+        st.warning(info_message)
+    st.info(f"Iniciando proximo ciclo em {pause_sec}s...")
+    time_mod.sleep(pause_sec)
+    _restart_turbo_job(job)
+    st.rerun()
+    return True
 
 
 def _load_dashboard_result_from_outputs(job: TurboJob) -> DashboardRunResult:
@@ -549,6 +875,7 @@ def _load_dashboard_result_from_outputs(job: TurboJob) -> DashboardRunResult:
         start=start_ts,
         end=end_ts,
         base_cfg=base_cfg,
+        outputs_root=str(outputs_root),
     )
 
 
@@ -604,6 +931,270 @@ def _tail_text_file(path: Path, max_lines: int = 40) -> str:
     lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
     return "\n".join(lines[-max_lines:])
 
+
+def _init_live_board(timeframes: list[str], strategies: list[str]) -> dict[str, dict[str, Any]]:
+    board: dict[str, dict[str, Any]] = {}
+    for tf in timeframes:
+        for strategy in strategies:
+            key = f"{tf}|{strategy}"
+            board[key] = {
+                "Timeframe": tf,
+                "Estrategia": strategy,
+                "Status": "Pendente",
+                "Score": None,
+                "Lucro Liquido": None,
+                "Fator Lucro": None,
+                "Score Parcial OOS": None,
+                "PnL Parcial OOS": None,
+                "Score Treino Atual": None,
+            }
+    return board
+
+
+def _upsert_live_board_row(
+    board: dict[str, dict[str, Any]],
+    timeframe: str,
+    strategy_name: str,
+    *,
+    status: str | None = None,
+    score: float | None = None,
+    net_profit: float | None = None,
+    profit_factor: float | None = None,
+    partial_score: float | None = None,
+    partial_net: float | None = None,
+    train_score: float | None = None,
+) -> None:
+    key = f"{timeframe}|{strategy_name}"
+    if key not in board:
+        board[key] = {
+            "Timeframe": timeframe,
+            "Estrategia": strategy_name,
+            "Status": "Pendente",
+            "Score": None,
+            "Lucro Liquido": None,
+            "Fator Lucro": None,
+            "Score Parcial OOS": None,
+            "PnL Parcial OOS": None,
+            "Score Treino Atual": None,
+        }
+    row = board[key]
+    if status is not None:
+        row["Status"] = status
+    if score is not None:
+        row["Score"] = float(score)
+    if net_profit is not None:
+        row["Lucro Liquido"] = float(net_profit)
+    if profit_factor is not None:
+        row["Fator Lucro"] = float(profit_factor)
+    if partial_score is not None:
+        row["Score Parcial OOS"] = float(partial_score)
+    if partial_net is not None:
+        row["PnL Parcial OOS"] = float(partial_net)
+    if train_score is not None:
+        row["Score Treino Atual"] = float(train_score)
+
+
+def _update_live_board_from_event(
+    board: dict[str, dict[str, Any]],
+    timeframe: str,
+    strategy_name: str,
+    event: dict[str, Any],
+) -> None:
+    stage = str(event.get("stage", ""))
+    sample_net = float(event.get("net_profit", 0.0)) if "net_profit" in event else None
+    sample_pf = float(event.get("profit_factor", 0.0)) if "profit_factor" in event else None
+    if stage in {"walkforward_start", "window_start"}:
+        _upsert_live_board_row(board, timeframe, strategy_name, status="Em andamento")
+        return
+    if stage in {"optimizer_sample", "optimizer_seed"}:
+        _upsert_live_board_row(
+            board,
+            timeframe,
+            strategy_name,
+            status="Em andamento",
+            train_score=float(event.get("score", 0.0)),
+            net_profit=sample_net,
+            profit_factor=sample_pf,
+        )
+        return
+    if stage == "window_complete":
+        _upsert_live_board_row(
+            board,
+            timeframe,
+            strategy_name,
+            status="Em andamento",
+            partial_score=float(event.get("oos_score", 0.0)),
+            partial_net=float(event.get("oos_net_profit", 0.0)),
+            net_profit=float(event.get("oos_net_profit", 0.0)),
+            profit_factor=float(event.get("oos_profit_factor", 0.0)),
+        )
+        return
+    if stage == "walkforward_done":
+        _upsert_live_board_row(
+            board,
+            timeframe,
+            strategy_name,
+            status="Concluida",
+            score=float(event.get("final_score", 0.0)),
+            net_profit=float(event.get("net_profit", 0.0)),
+            profit_factor=float(event.get("profit_factor", 0.0)),
+        )
+
+
+def _render_live_board(container: Any, board: dict[str, dict[str, Any]], title: str) -> None:
+    if not board:
+        return
+    frame = pd.DataFrame(list(board.values()))
+    if frame.empty:
+        return
+    frame["rank_score"] = pd.to_numeric(frame["Score"], errors="coerce")
+    frame["rank_partial"] = pd.to_numeric(frame["Score Parcial OOS"], errors="coerce")
+    frame["rank_key"] = frame["rank_score"].where(frame["rank_score"].notna(), frame["rank_partial"])
+    frame = frame.sort_values(["rank_key", "Lucro Liquido"], ascending=[False, False], na_position="last")
+    show = frame[
+        [
+            "Timeframe",
+            "Estrategia",
+            "Status",
+            "Score",
+            "Lucro Liquido",
+            "Fator Lucro",
+            "Score Parcial OOS",
+            "PnL Parcial OOS",
+            "Score Treino Atual",
+        ]
+    ].copy()
+
+    styled = (
+        show.style.format(
+            {
+                "Score": "{:.2f}",
+                "Lucro Liquido": "{:.2f}",
+                "Fator Lucro": "{:.2f}",
+                "Score Parcial OOS": "{:.2f}",
+                "PnL Parcial OOS": "{:.2f}",
+                "Score Treino Atual": "{:.2f}",
+            },
+            na_rep="-",
+        )
+        .applymap(
+            _color_pos_neg,
+            subset=["Score", "Lucro Liquido", "Fator Lucro", "Score Parcial OOS", "PnL Parcial OOS", "Score Treino Atual"],
+        )
+    )
+
+    with container.container():
+        st.markdown(f"### {title}")
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+def _color_pos_neg(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if number > 0:
+        return "color: #22d481; font-weight: 700;"
+    if number < 0:
+        return "color: #ff4f5e; font-weight: 700;"
+    return "color: #e9e9e9;"
+
+
+def _build_turbo_live_board(job: TurboJob) -> dict[str, dict[str, Any]]:
+    board = _init_live_board(job.timeframes, job.strategies)
+    log_path = Path(job.log_file)
+    if not log_path.exists():
+        return board
+    lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    progress_re = re.compile(r"^\[PROGRESS\]\s+([^/]+)/([^\s]+)\s+(.*)$")
+    done_re = re.compile(r"score=([-+]?\d+(?:\.\d+)?)\s+net=([-+]?\d+(?:\.\d+)?)\s+pf=([-+]?\d+(?:\.\d+)?)")
+    window_score_re = re.compile(r"oos_score=([-+]?\d+(?:\.\d+)?)")
+    window_net_re = re.compile(r"oos_net=([-+]?\d+(?:\.\d+)?)")
+    window_pf_re = re.compile(r"oos_pf=([-+]?\d+(?:\.\d+)?)")
+    sample_score_re = re.compile(r"score=([-+]?\d+(?:\.\d+)?)")
+    sample_net_re = re.compile(r"net=([-+]?\d+(?:\.\d+)?)")
+    sample_pf_re = re.compile(r"pf=([-+]?\d+(?:\.\d+)?)")
+    legacy_done_re = re.compile(r"score=([-+]?\d+(?:\.\d+)?)\s+net=([-+]?\d+(?:\.\d+)?)")
+    warn_re = re.compile(r"^\[WARN\]\s+([^/]+)/([^:]+):")
+
+    for line in lines:
+        progress_match = progress_re.match(line.strip())
+        if progress_match:
+            timeframe = progress_match.group(1)
+            strategy_name = progress_match.group(2)
+            rest = progress_match.group(3)
+            if rest.startswith("done "):
+                done_match = done_re.search(rest)
+                if done_match:
+                    _upsert_live_board_row(
+                        board,
+                        timeframe,
+                        strategy_name,
+                        status="Concluida",
+                        score=float(done_match.group(1)),
+                        net_profit=float(done_match.group(2)),
+                        profit_factor=float(done_match.group(3)),
+                    )
+                else:
+                    legacy_done_match = legacy_done_re.search(rest)
+                    if legacy_done_match:
+                        _upsert_live_board_row(
+                            board,
+                            timeframe,
+                            strategy_name,
+                            status="Concluida",
+                            score=float(legacy_done_match.group(1)),
+                            net_profit=float(legacy_done_match.group(2)),
+                        )
+                    else:
+                        _upsert_live_board_row(board, timeframe, strategy_name, status="Concluida")
+                continue
+            if rest.startswith("window ") and "done" in rest:
+                score_match = window_score_re.search(rest)
+                net_match = window_net_re.search(rest)
+                pf_match = window_pf_re.search(rest)
+                if score_match:
+                    _upsert_live_board_row(
+                        board,
+                        timeframe,
+                        strategy_name,
+                        status="Em andamento",
+                        partial_score=float(score_match.group(1)),
+                        partial_net=float(net_match.group(1)) if net_match else None,
+                        net_profit=float(net_match.group(1)) if net_match else None,
+                        profit_factor=float(pf_match.group(1)) if pf_match else None,
+                    )
+                else:
+                    _upsert_live_board_row(board, timeframe, strategy_name, status="Em andamento")
+                continue
+            if rest.startswith("sample "):
+                sample_match = sample_score_re.search(rest)
+                sample_net_match = sample_net_re.search(rest)
+                sample_pf_match = sample_pf_re.search(rest)
+                _upsert_live_board_row(
+                    board,
+                    timeframe,
+                    strategy_name,
+                    status="Em andamento",
+                    train_score=float(sample_match.group(1)) if sample_match else None,
+                    net_profit=float(sample_net_match.group(1)) if sample_net_match else None,
+                    profit_factor=float(sample_pf_match.group(1)) if sample_pf_match else None,
+                )
+                continue
+            _upsert_live_board_row(board, timeframe, strategy_name, status="Em andamento")
+            continue
+
+        warn_match = warn_re.match(line.strip())
+        if warn_match:
+            _upsert_live_board_row(
+                board,
+                warn_match.group(1),
+                warn_match.group(2).strip(),
+                status="Erro",
+            )
+
+    return board
+
 def _run_dashboard(
     symbol: str,
     raw_timeframes: list[str],
@@ -623,6 +1214,7 @@ def _run_dashboard(
     status_box = st.empty()
     progress_box = st.progress(0)
     progress_text = st.empty()
+    ranking_box = st.empty()
 
     start_ts = pd.Timestamp(start_date)
     end_ts = pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
@@ -637,6 +1229,11 @@ def _run_dashboard(
 
     normalized_timeframes = [normalize_timeframe_label(tf) for tf in raw_timeframes]
     selected_strategies = [STRATEGIES[name] for name in strategy_names]
+    live_board = _init_live_board(
+        normalized_timeframes,
+        [x.name for x in selected_strategies],
+    )
+    _render_live_board(ranking_box, live_board, title="Ranking em Tempo Real")
     total_jobs = len(normalized_timeframes) * len(selected_strategies)
     run_id = build_run_id(prefix="ui_wf")
 
@@ -665,6 +1262,13 @@ def _run_dashboard(
         data_hashes[timeframe] = dataframe_sha256(df)
 
         for strategy in selected_strategies:
+            trades_file = tf_output / f"trades_{timeframe}_{strategy.name}.csv"
+            windows_file = tf_output / f"walkforward_windows_{timeframe}_{strategy.name}.csv"
+            topk_file = tf_output / f"walkforward_topk_{timeframe}_{strategy.name}.csv"
+            equity_curve_file = tf_output / f"equity_curve_{timeframe}_{strategy.name}.csv"
+            checkpoint_file = tf_output / f"checkpoint_{timeframe}_{strategy.name}.json"
+            _upsert_live_board_row(live_board, timeframe, strategy.name, status="Em andamento")
+            _render_live_board(ranking_box, live_board, title="Ranking em Tempo Real")
             latest_progress: dict[str, Any] = {}
 
             def _progress_callback(event: dict[str, Any]) -> None:
@@ -678,6 +1282,8 @@ def _run_dashboard(
                         return
                 latest_progress.clear()
                 latest_progress.update(event)
+                _update_live_board_from_event(live_board, timeframe, strategy.name, latest_progress)
+                _render_live_board(ranking_box, live_board, title="Ranking em Tempo Real")
                 _render_progress(
                     status_box=status_box,
                     progress_text=progress_text,
@@ -693,6 +1299,19 @@ def _run_dashboard(
                 optimizer_config=optimizer_cfg,
                 wf_config=wf_cfg,
                 progress_callback=_progress_callback if live_updates else None,
+                checkpoint_callback=(
+                    _build_ui_checkpoint_callback(
+                        timeframe=timeframe,
+                        strategy_name=strategy.name,
+                        trades_file=trades_file,
+                        windows_file=windows_file,
+                        topk_file=topk_file,
+                        equity_curve_file=equity_curve_file,
+                        checkpoint_file=checkpoint_file,
+                    )
+                    if save_outputs
+                    else None
+                ),
             )
 
             finished_jobs += 1
@@ -702,6 +1321,16 @@ def _run_dashboard(
             )
 
             strategy_runs.append(StrategyRun(timeframe=timeframe, strategy_name=strategy.name, result=wf_result))
+            _upsert_live_board_row(
+                live_board,
+                timeframe,
+                strategy.name,
+                status="Concluida",
+                score=float(wf_result.consolidated_metrics.get("score", 0.0)),
+                net_profit=float(wf_result.consolidated_metrics.get("net_profit", 0.0)),
+                profit_factor=float(wf_result.consolidated_metrics.get("profit_factor", 0.0)),
+            )
+            _render_live_board(ranking_box, live_board, title="Ranking em Tempo Real")
             summary_rows.append(
                 {
                     "timeframe": timeframe,
@@ -722,12 +1351,14 @@ def _run_dashboard(
                 )
                 generated_files.extend(
                     [
-                        str(tf_output / f"trades_{timeframe}_{strategy.name}.csv"),
-                        str(tf_output / f"walkforward_windows_{timeframe}_{strategy.name}.csv"),
-                        str(tf_output / f"walkforward_topk_{timeframe}_{strategy.name}.csv"),
-                        str(tf_output / f"equity_curve_{timeframe}_{strategy.name}.csv"),
+                        str(trades_file),
+                        str(windows_file),
+                        str(topk_file),
+                        str(equity_curve_file),
+                        str(checkpoint_file),
                         str(tf_output / f"equity_{timeframe}_{strategy.name}.png"),
                         str(tf_output / f"monthly_{timeframe}_{strategy.name}.csv"),
+                        str(tf_output / f"hourly_{timeframe}_{strategy.name}.csv"),
                         str(tf_output / f"sensitivity_{timeframe}_{strategy.name}.csv"),
                         str(tf_output / f"robustness_{timeframe}_{strategy.name}.json"),
                     ]
@@ -739,13 +1370,20 @@ def _run_dashboard(
                 timeframe=timeframe,
                 strategy_runs=[x for x in strategy_runs if x.timeframe == timeframe],
                 output_dir=tf_output,
+                run_tag=run_id,
             )
             generated_files.extend(
                 [
                     str(tf_output / f"summary_{timeframe}.csv"),
                     str(tf_output / f"best_params_{timeframe}.json"),
                     str(tf_output / f"equity_curve_{timeframe}_best.csv"),
+                    str(tf_output / f"strategy_history_{timeframe}.csv"),
                     str(tf_output / f"equity_{timeframe}_best.png"),
+                    str(tf_output / f"summary_{timeframe}_{run_id}.csv"),
+                    str(tf_output / f"best_params_{timeframe}_{run_id}.json"),
+                    str(tf_output / f"equity_curve_{timeframe}_best_{run_id}.csv"),
+                    str(tf_output / f"equity_{timeframe}_best_{run_id}.png"),
+                    str(tf_output / f"best_history_{timeframe}.csv"),
                 ]
             )
 
@@ -787,6 +1425,7 @@ def _run_dashboard(
         start=start_ts,
         end=end_ts,
         base_cfg=base_bt_cfg,
+        outputs_root=str(outputs_root),
     )
 
 
@@ -815,19 +1454,64 @@ def _render_progress(
         idx = int(event.get("sample_index", 0))
         total = int(event.get("samples_total", 0))
         score = float(event.get("score", 0.0))
-        progress_text.caption(f"Otimizacao: amostra {idx}/{total} | score treino {score:.2f}")
+        pnl = float(event.get("net_profit", 0.0))
+        pf = float(event.get("profit_factor", 0.0))
+        progress_text.caption(
+            f"Otimizacao: amostra {idx}/{total} | score treino {score:.2f} "
+            f"| lucro treino {format_brl(pnl)} | fator lucro {pf:.2f}"
+        )
         return
     if stage == "window_complete":
         idx = int(event.get("window_index", 0))
         total = int(event.get("total_windows", 0))
         score = float(event.get("oos_score", 0.0))
         pnl = float(event.get("oos_net_profit", 0.0))
-        progress_text.caption(f"Janela {idx}/{total} concluida | score OOS {score:.2f} | pnl OOS {format_brl(pnl)}")
+        pf = float(event.get("oos_profit_factor", 0.0))
+        progress_text.caption(
+            f"Janela {idx}/{total} concluida | score OOS {score:.2f} "
+            f"| pnl OOS {format_brl(pnl)} | fator lucro OOS {pf:.2f}"
+        )
         return
     if stage == "walkforward_done":
         score = float(event.get("final_score", 0.0))
         pnl = float(event.get("net_profit", 0.0))
-        progress_text.caption(f"Consolidado: score {score:.2f} | lucro liquido {format_brl(pnl)}")
+        pf = float(event.get("profit_factor", 0.0))
+        progress_text.caption(
+            f"Consolidado: score {score:.2f} | lucro liquido {format_brl(pnl)} | fator lucro {pf:.2f}"
+        )
+
+
+def _build_ui_checkpoint_callback(
+    timeframe: str,
+    strategy_name: str,
+    trades_file: Path,
+    windows_file: Path,
+    topk_file: Path,
+    equity_curve_file: Path,
+    checkpoint_file: Path,
+):
+    def _checkpoint(checkpoint: Any) -> None:
+        _write_trades_csv(checkpoint.oos_trades, trades_file)
+        checkpoint.window_results.to_csv(windows_file, index=False)
+        checkpoint.topk_test_results.to_csv(topk_file, index=False)
+        checkpoint.oos_equity.to_csv(equity_curve_file, index=False)
+        checkpoint_file.write_text(
+            json.dumps(
+                {
+                    "timeframe": timeframe,
+                    "strategy": strategy_name,
+                    "windows_completed": int(checkpoint.windows_completed),
+                    "total_windows": int(checkpoint.total_windows),
+                    "latest_oos_score": float(checkpoint.latest_oos_score),
+                    "latest_oos_net_profit": float(checkpoint.latest_oos_net_profit),
+                    "updated_at_utc": pd.Timestamp.utcnow().isoformat(),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    return _checkpoint
 
 
 def _save_strategy_outputs(
@@ -865,6 +1549,10 @@ def _save_strategy_outputs(
     )
     monthly_df.to_csv(monthly_file, index=False)
 
+    hourly_file = output_dir / f"hourly_{timeframe}_{strategy_name}.csv"
+    hourly_df = build_hourly_report(wf_result.oos_trades)
+    hourly_df.to_csv(hourly_file, index=False)
+
     sensitivity_file = output_dir / f"sensitivity_{timeframe}_{strategy_name}.csv"
     sensitivity_df = build_parameter_sensitivity_report(wf_result.topk_test_results)
     sensitivity_df.to_csv(sensitivity_file, index=False)
@@ -883,6 +1571,7 @@ def _save_best_outputs_for_timeframe(
     timeframe: str,
     strategy_runs: list[StrategyRun],
     output_dir: Path,
+    run_tag: str,
 ) -> None:
     if not strategy_runs:
         return
@@ -898,7 +1587,11 @@ def _save_best_outputs_for_timeframe(
             }
         )
     summary_df = pd.DataFrame(rows).sort_values("score", ascending=False)
-    summary_df.to_csv(output_dir / f"summary_{timeframe}.csv", index=False)
+    summary_latest = output_dir / f"summary_{timeframe}.csv"
+    summary_df.to_csv(summary_latest, index=False)
+    run_token = run_tag.strip() or "snapshot"
+    summary_snapshot = output_dir / f"summary_{timeframe}_{run_token}.csv"
+    summary_df.to_csv(summary_snapshot, index=False)
     if summary_df.empty:
         return
 
@@ -917,15 +1610,72 @@ def _save_best_outputs_for_timeframe(
             for run in strategy_runs
         },
     }
-    (output_dir / f"best_params_{timeframe}.json").write_text(
+    best_params_latest = output_dir / f"best_params_{timeframe}.json"
+    best_params_latest.write_text(
         json.dumps(payload, indent=2, default=_json_default),
         encoding="utf-8",
     )
-    best_run.result.oos_equity.to_csv(output_dir / f"equity_curve_{timeframe}_best.csv", index=False)
+    best_params_snapshot = output_dir / f"best_params_{timeframe}_{run_token}.json"
+    best_params_snapshot.write_text(
+        json.dumps(payload, indent=2, default=_json_default),
+        encoding="utf-8",
+    )
+
+    _append_strategy_history_rows(
+        history_file=output_dir / f"strategy_history_{timeframe}.csv",
+        summary_df=summary_df,
+        run_tag=run_token,
+        created_at_utc=pd.Timestamp.utcnow().isoformat(),
+        symbol=symbol,
+        timeframe=timeframe,
+        best_strategy=best_name,
+        summary_latest=summary_latest,
+        summary_snapshot=summary_snapshot,
+        best_params_latest=best_params_latest,
+        best_params_snapshot=best_params_snapshot,
+        output_dir=output_dir,
+    )
+    best_equity_latest = output_dir / f"equity_curve_{timeframe}_best.csv"
+    best_run.result.oos_equity.to_csv(best_equity_latest, index=False)
+    best_equity_snapshot = output_dir / f"equity_curve_{timeframe}_best_{run_token}.csv"
+    best_run.result.oos_equity.to_csv(best_equity_snapshot, index=False)
+    best_plot_latest = output_dir / f"equity_{timeframe}_best.png"
     _save_equity_png(
         best_run.result.oos_equity,
         title=f"{symbol} {timeframe} - best: {best_name}",
-        output_file=output_dir / f"equity_{timeframe}_best.png",
+        output_file=best_plot_latest,
+    )
+    best_plot_snapshot = output_dir / f"equity_{timeframe}_best_{run_token}.png"
+    _save_equity_png(
+        best_run.result.oos_equity,
+        title=f"{symbol} {timeframe} - best: {best_name} ({run_token})",
+        output_file=best_plot_snapshot,
+    )
+
+    _append_best_history_row(
+        history_file=output_dir / f"best_history_{timeframe}.csv",
+        row={
+            "run_tag": run_token,
+            "created_at_utc": pd.Timestamp.utcnow().isoformat(),
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "best_strategy": best_name,
+            "best_score": float(summary_df.iloc[0]["score"]),
+            "best_net_profit": float(best_run.result.consolidated_metrics.get("net_profit", 0.0)),
+            "best_trade_count": float(best_run.result.consolidated_metrics.get("trade_count", 0.0)),
+            "best_win_rate": float(best_run.result.consolidated_metrics.get("win_rate", 0.0)),
+            "best_max_drawdown": float(best_run.result.consolidated_metrics.get("max_drawdown", 0.0)),
+            "best_max_drawdown_pct": float(best_run.result.consolidated_metrics.get("max_drawdown_pct", 0.0)),
+            "windows": int(len(best_run.result.window_results)),
+            "summary_latest": str(summary_latest),
+            "summary_snapshot": str(summary_snapshot),
+            "best_params_latest": str(best_params_latest),
+            "best_params_snapshot": str(best_params_snapshot),
+            "best_equity_latest": str(best_equity_latest),
+            "best_equity_snapshot": str(best_equity_snapshot),
+            "best_plot_latest": str(best_plot_latest),
+            "best_plot_snapshot": str(best_plot_snapshot),
+        },
     )
 
 
@@ -936,6 +1686,93 @@ def _write_trades_csv(trades: pd.DataFrame, output_file: Path) -> None:
     out = trades.copy()
     out["params"] = out["params"].apply(lambda p: json.dumps(p, sort_keys=True))
     out.to_csv(output_file, index=False)
+
+
+def _append_best_history_row(history_file: Path, row: dict[str, Any]) -> None:
+    history_file.parent.mkdir(parents=True, exist_ok=True)
+    row_df = pd.DataFrame([row])
+    if history_file.exists():
+        prev = pd.read_csv(history_file)
+        if not prev.empty and {"run_tag", "timeframe"}.issubset(set(prev.columns)):
+            mask = (prev["run_tag"].astype(str) == str(row.get("run_tag", ""))) & (
+                prev["timeframe"].astype(str) == str(row.get("timeframe", ""))
+            )
+            prev = prev.loc[~mask].copy()
+        out = pd.concat([prev, row_df], ignore_index=True)
+    else:
+        out = row_df
+    out = out.sort_values("created_at_utc", ascending=False)
+    out.to_csv(history_file, index=False)
+
+
+def _append_strategy_history_rows(
+    history_file: Path,
+    summary_df: pd.DataFrame,
+    run_tag: str,
+    created_at_utc: str,
+    symbol: str,
+    timeframe: str,
+    best_strategy: str,
+    summary_latest: Path,
+    summary_snapshot: Path,
+    best_params_latest: Path,
+    best_params_snapshot: Path,
+    output_dir: Path,
+) -> None:
+    if summary_df.empty:
+        return
+    history_file.parent.mkdir(parents=True, exist_ok=True)
+    ranked = summary_df.sort_values("score", ascending=False).reset_index(drop=True)
+    rows: list[dict[str, Any]] = []
+    for rank_idx, (_, item) in enumerate(ranked.iterrows(), start=1):
+        strategy = str(item.get("strategy", "")).strip()
+        if not strategy:
+            continue
+        rows.append(
+            {
+                "run_tag": run_tag,
+                "created_at_utc": created_at_utc,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "strategy": strategy,
+                "is_best": int(strategy == best_strategy),
+                "rank_in_run": int(rank_idx),
+                "score": float(item.get("score", 0.0)),
+                "net_profit": float(item.get("net_profit", 0.0)),
+                "trade_count": float(item.get("trade_count", 0.0)),
+                "win_rate": float(item.get("win_rate", 0.0)),
+                "max_drawdown": float(item.get("max_drawdown", 0.0)),
+                "max_drawdown_pct": float(item.get("max_drawdown_pct", 0.0)),
+                "windows": int(item.get("windows", 0)),
+                "summary_latest": str(summary_latest),
+                "summary_snapshot": str(summary_snapshot),
+                "best_params_latest": str(best_params_latest),
+                "best_params_snapshot": str(best_params_snapshot),
+                "trades_latest": str(output_dir / f"trades_{timeframe}_{strategy}.csv"),
+                "windows_latest": str(output_dir / f"walkforward_windows_{timeframe}_{strategy}.csv"),
+                "topk_latest": str(output_dir / f"walkforward_topk_{timeframe}_{strategy}.csv"),
+                "equity_latest": str(output_dir / f"equity_curve_{timeframe}_{strategy}.csv"),
+                "equity_plot_latest": str(output_dir / f"equity_{timeframe}_{strategy}.png"),
+            }
+        )
+    if not rows:
+        return
+
+    row_df = pd.DataFrame(rows)
+    if history_file.exists():
+        prev = pd.read_csv(history_file)
+        if not prev.empty and {"run_tag", "timeframe", "strategy"}.issubset(set(prev.columns)):
+            mask = (
+                (prev["run_tag"].astype(str) == str(run_tag))
+                & (prev["timeframe"].astype(str) == str(timeframe))
+                & (prev["strategy"].astype(str).isin(row_df["strategy"].astype(str)))
+            )
+            prev = prev.loc[~mask].copy()
+        out = pd.concat([prev, row_df], ignore_index=True)
+    else:
+        out = row_df
+    out = out.sort_values(["created_at_utc", "rank_in_run"], ascending=[False, True])
+    out.to_csv(history_file, index=False)
 
 
 def _save_equity_png(equity_df: pd.DataFrame, title: str, output_file: Path) -> None:
@@ -956,12 +1793,42 @@ def _save_equity_png(equity_df: pd.DataFrame, title: str, output_file: Path) -> 
     plt.close()
 
 def _render_result(result: DashboardRunResult) -> None:
-    st.subheader("Consolidado")
-    st.dataframe(
-        result.summary,
-        use_container_width=True,
-        hide_index=True,
+    menu_options = [
+        "Consolidado",
+        "Resumo",
+        "Operacoes",
+        "Grafico de Operacoes",
+        "Patrimonio",
+        "Mensal",
+        "Melhores Horas",
+        "Robustez",
+    ]
+    selected_view = st.radio(
+        "Menu",
+        options=menu_options,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="dashboard_top_menu",
     )
+
+    if selected_view == "Consolidado":
+        st.subheader("Consolidado")
+        st.dataframe(
+            result.summary,
+            use_container_width=True,
+            hide_index=True,
+        )
+        history_df = _load_best_history(outputs_root=Path(result.outputs_root), symbol=result.symbol)
+        if history_df.empty:
+            st.info("Historico de melhores ainda vazio para este ativo.")
+        else:
+            st.markdown("### Historico de Melhores")
+            _render_best_history_table(history_df)
+        st.caption(
+            f"Periodo {result.start.date()} a {result.end.date()} | "
+            f"Ativo {result.symbol} | Estrategias validadas: {len(result.strategy_runs)}"
+        )
+        return
 
     timeframe_options = sorted(result.summary["timeframe"].unique().tolist())
     selected_tf = st.selectbox("Timeframe", options=timeframe_options, index=0)
@@ -981,6 +1848,7 @@ def _render_result(result: DashboardRunResult) -> None:
         equity_curve=equity,
         initial_capital=result.base_cfg.initial_capital,
     )
+    hourly_df = build_hourly_report(trades)
     robustness_payload = build_robustness_report(
         window_results=selected_run.result.window_results,
         topk_test_results=selected_run.result.topk_test_results,
@@ -988,9 +1856,7 @@ def _render_result(result: DashboardRunResult) -> None:
     )
     sensitivity_df = build_parameter_sensitivity_report(selected_run.result.topk_test_results)
 
-    tabs = st.tabs(["Resumo", "Operacoes", "Grafico de Operacoes", "Patrimonio", "Mensal", "Robustez"])
-
-    with tabs[0]:
+    if selected_view == "Resumo":
         summary = _build_summary_snapshot(trades=trades, equity=equity, base_cfg=result.base_cfg)
         c1, c2 = st.columns(2)
         with c1:
@@ -1023,7 +1889,7 @@ def _render_result(result: DashboardRunResult) -> None:
             f"Ativo {result.symbol} | Timeframe {selected_tf} | Estrategia {selected_strategy}"
         )
 
-    with tabs[1]:
+    if selected_view == "Operacoes":
         operations_df = _build_operations_table(
             trades=trades,
             initial_capital=result.base_cfg.initial_capital,
@@ -1042,11 +1908,11 @@ def _render_result(result: DashboardRunResult) -> None:
                 hide_index=True,
             )
 
-    with tabs[2]:
+    if selected_view == "Grafico de Operacoes":
         op_fig = _build_operations_chart(trades)
         st.plotly_chart(op_fig, use_container_width=True)
 
-    with tabs[3]:
+    if selected_view == "Patrimonio":
         eq_fig = _build_equity_chart(
             equity=equity,
             symbol=result.symbol,
@@ -1055,7 +1921,7 @@ def _render_result(result: DashboardRunResult) -> None:
         )
         st.plotly_chart(eq_fig, use_container_width=True)
 
-    with tabs[4]:
+    if selected_view == "Mensal":
         if monthly_df.empty:
             st.info("Sem dados mensais para o periodo selecionado.")
         else:
@@ -1078,7 +1944,34 @@ def _render_result(result: DashboardRunResult) -> None:
             )
             st.plotly_chart(fig, use_container_width=True)
 
-    with tabs[5]:
+    if selected_view == "Melhores Horas":
+        if hourly_df.empty:
+            st.info("Sem operacoes suficientes para analise por hora.")
+        else:
+            show = hourly_df.copy()
+            show["hour"] = show["hour"].astype(int).map(lambda x: f"{x:02d}:00")
+            st.dataframe(show, use_container_width=True, hide_index=True)
+
+            fig = go.Figure()
+            fig.add_trace(
+                go.Bar(
+                    x=show["hour"],
+                    y=hourly_df["net_profit"],
+                    marker_color=["#22d481" if x >= 0 else "#ff4f5e" for x in hourly_df["net_profit"]],
+                    name="PnL por hora",
+                )
+            )
+            fig.update_layout(
+                title="Melhores Horas para Operar (PnL)",
+                template="plotly_dark",
+                paper_bgcolor="#1e1f22",
+                plot_bgcolor="#1e1f22",
+                yaxis_title="R$",
+                xaxis_title="Hora",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    if selected_view == "Robustez":
         alerts = robustness_payload.get("alerts", [])
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -1111,6 +2004,202 @@ def _render_result(result: DashboardRunResult) -> None:
         if not sensitivity_df.empty:
             st.markdown("**Sensibilidade de Parametros (top-k em teste)**")
             st.dataframe(sensitivity_df, use_container_width=True, hide_index=True)
+
+
+def _load_best_history(outputs_root: Path, symbol: str) -> pd.DataFrame:
+    base = outputs_root / symbol
+    if not base.exists():
+        return pd.DataFrame()
+    files = sorted(base.glob("*/best_history_*.csv"))
+    if not files:
+        return pd.DataFrame()
+    frames: list[pd.DataFrame] = []
+    for path in files:
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    if "created_at_utc" in out.columns:
+        out["created_at_utc"] = pd.to_datetime(out["created_at_utc"], errors="coerce")
+    sort_cols = [c for c in ["created_at_utc", "best_score", "best_net_profit"] if c in out.columns]
+    if sort_cols:
+        ascending = [False] * len(sort_cols)
+        out = out.sort_values(sort_cols, ascending=ascending, na_position="last")
+    return out.reset_index(drop=True)
+
+
+def _render_best_history_table(history_df: pd.DataFrame) -> None:
+    local = history_df.copy()
+    def _series(col: str, default: Any = "") -> pd.Series:
+        if col in local.columns:
+            return local[col]
+        return pd.Series([default] * len(local))
+
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        tf_options = ["Todos"] + sorted(_series("timeframe").dropna().astype(str).unique().tolist())
+        tf_filter = st.selectbox("Timeframe (historico)", options=tf_options, index=0, key="hist_tf_filter")
+    with c2:
+        strat_options = ["Todas"] + sorted(_series("best_strategy").dropna().astype(str).unique().tolist())
+        strat_filter = st.selectbox("Estrategia (historico)", options=strat_options, index=0, key="hist_strat_filter")
+    with c3:
+        max_rows = int(st.slider("Linhas", min_value=10, max_value=500, value=120, step=10, key="hist_rows"))
+
+    if tf_filter != "Todos":
+        local = local.loc[_series("timeframe").astype(str) == tf_filter].copy()
+    if strat_filter != "Todas":
+        local = local.loc[_series("best_strategy").astype(str) == strat_filter].copy()
+
+    if local.empty:
+        st.warning("Nenhuma linha no historico com os filtros selecionados.")
+        return
+
+    work = local.copy()
+    work["created_at_utc"] = pd.to_datetime(_series("created_at_utc"), errors="coerce")
+    work["best_score"] = pd.to_numeric(_series("best_score"), errors="coerce")
+    work["best_net_profit"] = pd.to_numeric(_series("best_net_profit"), errors="coerce")
+    work["best_trade_count"] = pd.to_numeric(_series("best_trade_count"), errors="coerce")
+    work["best_win_rate"] = pd.to_numeric(_series("best_win_rate"), errors="coerce")
+    work["best_max_drawdown"] = pd.to_numeric(_series("best_max_drawdown"), errors="coerce")
+    work["timeframe"] = _series("timeframe").astype(str)
+    work["best_strategy"] = _series("best_strategy").astype(str)
+    work["run_tag"] = _series("run_tag").astype(str)
+
+    st.markdown("#### Resumo das Melhores Estrategias Achadas")
+    rollup = (
+        work.groupby(["timeframe", "best_strategy"], as_index=False)
+        .agg(
+            runs=("run_tag", "count"),
+            melhor_score=("best_score", "max"),
+            score_medio=("best_score", "mean"),
+            melhor_pnl=("best_net_profit", "max"),
+            pnl_medio=("best_net_profit", "mean"),
+            win_rate_medio=("best_win_rate", "mean"),
+            dd_medio=("best_max_drawdown", "mean"),
+            trades_medios=("best_trade_count", "mean"),
+        )
+        .sort_values(["melhor_pnl", "melhor_score"], ascending=[False, False], na_position="last")
+    )
+
+    latest = (
+        work.sort_values("created_at_utc", ascending=False)
+        .drop_duplicates(subset=["timeframe", "best_strategy"], keep="first")[
+            ["timeframe", "best_strategy", "created_at_utc", "best_net_profit", "best_score"]
+        ]
+        .rename(
+            columns={
+                "created_at_utc": "ultima_execucao",
+                "best_net_profit": "ultimo_pnl",
+                "best_score": "ultimo_score",
+            }
+        )
+    )
+    rollup = rollup.merge(latest, on=["timeframe", "best_strategy"], how="left")
+    rollup_view = pd.DataFrame(
+        {
+            "TF": rollup["timeframe"],
+            "Estrategia": rollup["best_strategy"],
+            "Runs": rollup["runs"].fillna(0).astype(int),
+            "Melhor PnL (R$)": rollup["melhor_pnl"].round(2),
+            "PnL Medio (R$)": rollup["pnl_medio"].round(2),
+            "Melhor Score": rollup["melhor_score"].round(2),
+            "Score Medio": rollup["score_medio"].round(2),
+            "Win Medio %": (100.0 * rollup["win_rate_medio"]).round(2),
+            "DD Medio (R$)": rollup["dd_medio"].round(2),
+            "Trades Medios": rollup["trades_medios"].round(1),
+            "Ultimo PnL (R$)": rollup["ultimo_pnl"].round(2),
+            "Ultimo Score": rollup["ultimo_score"].round(2),
+            "Ultima Execucao": pd.to_datetime(rollup["ultima_execucao"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+
+    def _color_value(v: Any) -> str:
+        try:
+            return "color: #22d481;" if float(v) >= 0 else "color: #ff4f5e;"
+        except Exception:
+            return ""
+
+    rollup_styled = (
+        rollup_view.style
+        .map(_color_value, subset=["Melhor PnL (R$)", "PnL Medio (R$)", "Ultimo PnL (R$)"])
+        .map(_color_value, subset=["Melhor Score", "Score Medio", "Ultimo Score"])
+    )
+    st.dataframe(rollup_styled, use_container_width=True, hide_index=True)
+
+    if not rollup.empty:
+        best_row = rollup.iloc[0]
+        st.caption(
+            "Top atual: "
+            f"{best_row['timeframe']}/{best_row['best_strategy']} | "
+            f"melhor pnl {format_brl(float(best_row['melhor_pnl']))} | "
+            f"melhor score {float(best_row['melhor_score']):.2f}"
+        )
+
+    view = pd.DataFrame(
+        {
+            "Data UTC": pd.to_datetime(_series("created_at_utc"), errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "Run": _series("run_tag").astype(str),
+            "TF": _series("timeframe").astype(str),
+            "Estrategia": _series("best_strategy").astype(str),
+            "Score": pd.to_numeric(_series("best_score"), errors="coerce").round(2),
+            "PnL (R$)": pd.to_numeric(_series("best_net_profit"), errors="coerce").round(2),
+            "Trades": pd.to_numeric(_series("best_trade_count"), errors="coerce").fillna(0).astype(int),
+            "Win %": (100.0 * pd.to_numeric(_series("best_win_rate"), errors="coerce")).round(2),
+            "DD (R$)": pd.to_numeric(_series("best_max_drawdown"), errors="coerce").round(2),
+            "DD %": pd.to_numeric(_series("best_max_drawdown_pct"), errors="coerce").round(2),
+            "Janelas": pd.to_numeric(_series("windows"), errors="coerce").fillna(0).astype(int),
+        }
+    ).head(max_rows)
+
+    def _color_pnl(v: Any) -> str:
+        try:
+            return "color: #22d481;" if float(v) >= 0 else "color: #ff4f5e;"
+        except Exception:
+            return ""
+
+    styled = view.style.map(_color_pnl, subset=["PnL (R$)"]).map(_color_pnl, subset=["Score"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Baixar historico filtrado (CSV)",
+        data=local.to_csv(index=False).encode("utf-8"),
+        file_name="best_history_filtrado.csv",
+        mime="text/csv",
+    )
+
+    run_options = _series("run_tag").astype(str).tolist()
+    selected_run = st.selectbox("Detalhe da execucao", options=run_options, index=0, key="hist_run_detail")
+    row = local.loc[_series("run_tag").astype(str) == selected_run].head(1)
+    if row.empty:
+        return
+    item = row.iloc[0]
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        st.metric("Estrategia", str(item.get("best_strategy", "-")))
+        st.metric("PnL", format_brl(float(item.get("best_net_profit", 0.0))))
+    with d2:
+        st.metric("Score", f"{float(item.get('best_score', 0.0)):.2f}")
+        st.metric("Trades", format_int(float(item.get("best_trade_count", 0))))
+    with d3:
+        st.metric("Win rate", f"{100.0 * float(item.get('best_win_rate', 0.0)):.2f}%")
+        st.metric("DD", format_brl(float(item.get("best_max_drawdown", 0.0))))
+
+    st.caption("Arquivos da execucao selecionada")
+    artifact_cols = [
+        "summary_snapshot",
+        "best_params_snapshot",
+        "best_equity_snapshot",
+        "best_plot_snapshot",
+    ]
+    for col in artifact_cols:
+        raw = str(item.get(col, "")).strip()
+        if raw:
+            st.code(raw, language="text")
 
 
 def _build_summary_snapshot(
@@ -1309,28 +2398,91 @@ def _build_equity_chart(
         return fig
 
     plot_df = equity.copy()
-    plot_df["datetime"] = pd.to_datetime(plot_df["datetime"])
-    plot_df = plot_df.sort_values("datetime")
+    plot_df["datetime"] = pd.to_datetime(plot_df["datetime"], errors="coerce")
+    plot_df["equity"] = pd.to_numeric(plot_df["equity"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["datetime", "equity"]).sort_values("datetime")
+    if plot_df.empty:
+        return fig
+
+    initial_equity = float(plot_df["equity"].iloc[0])
+    plot_df["pnl_curve"] = plot_df["equity"] - initial_equity
+    plot_df["pnl_pos"] = plot_df["pnl_curve"].where(plot_df["pnl_curve"] >= 0)
+    plot_df["pnl_neg"] = plot_df["pnl_curve"].where(plot_df["pnl_curve"] < 0)
+
     fig.add_trace(
         go.Scatter(
             x=plot_df["datetime"],
-            y=plot_df["equity"],
+            y=plot_df["pnl_pos"],
             mode="lines",
-            line=dict(color="#22f08a", width=2),
+            line=dict(color="#22f08a", width=2.2),
             fill="tozeroy",
-            fillcolor="rgba(34, 240, 138, 0.25)",
+            fillcolor="rgba(34, 240, 138, 0.22)",
             name=symbol,
+            hovertemplate="%{x|%d/%m/%Y %H:%M}<br>Valor: R$ %{y:,.2f}<extra>Positivo</extra>",
         )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df["datetime"],
+            y=plot_df["pnl_neg"],
+            mode="lines",
+            line=dict(color="#ff4f5e", width=2.2),
+            fill="tozeroy",
+            fillcolor="rgba(255, 79, 94, 0.20)",
+            name=symbol,
+            hovertemplate="%{x|%d/%m/%Y %H:%M}<br>Valor: R$ %{y:,.2f}<extra>Negativo</extra>",
+            showlegend=False,
+        )
+    )
+    last_x = plot_df["datetime"].iloc[-1]
+    last_y = float(plot_df["pnl_curve"].iloc[-1])
+    first_y = 0.0
+    fig.add_hline(
+        y=first_y,
+        line_width=1,
+        line_dash="dot",
+        line_color="rgba(255,255,255,0.22)",
+    )
+    fig.add_annotation(
+        x=last_x,
+        y=last_y,
+        text=_format_brl_compact(last_y),
+        showarrow=False,
+        xanchor="left",
+        yanchor="middle",
+        xshift=8,
+        font=dict(color="#0f1f16", size=11, family="Barlow Condensed, Segoe UI, sans-serif"),
+        bgcolor="#25f08a" if last_y >= 0 else "#ff4f5e",
+        bordercolor="#25f08a" if last_y >= 0 else "#ff4f5e",
+        borderwidth=1,
+        opacity=0.95,
     )
     fig.update_layout(
         title="Patrimonio",
         template="plotly_dark",
-        paper_bgcolor="#1e1f22",
-        plot_bgcolor="#1e1f22",
+        paper_bgcolor="#1b1d20",
+        plot_bgcolor="#1a1c1f",
         font=dict(family="Barlow Condensed, Segoe UI, sans-serif", color="#f5f5f5"),
         xaxis_title=None,
-        yaxis_title="Saldo Bruto (R$)",
-        legend=dict(orientation="h", yanchor="top", y=-0.1, xanchor="left", x=0),
+        yaxis_title="Resultado Acumulado (R$)",
+        legend=dict(orientation="h", yanchor="top", y=-0.11, xanchor="left", x=0),
+        margin=dict(l=16, r=72, t=52, b=48),
+        hovermode="x unified",
+    )
+    fig.update_xaxes(
+        showgrid=True,
+        gridcolor="rgba(255,255,255,0.08)",
+        tickformat="%d/%m/%Y",
+        zeroline=False,
+    )
+    fig.update_yaxes(
+        side="right",
+        showgrid=True,
+        gridcolor="rgba(255,255,255,0.08)",
+        zeroline=True,
+        zerolinecolor="rgba(255,255,255,0.22)",
+        tickformat="~s",
+        rangemode="normal",
     )
     return fig
 
@@ -1408,6 +2560,19 @@ def format_brl(value: float) -> str:
     return f"{sign}R$ {raw}"
 
 
+def _format_brl_compact(value: float) -> str:
+    abs_value = abs(float(value))
+    sign = "-" if value < 0 else ""
+    if abs_value >= 1_000_000:
+        raw = f"{abs_value / 1_000_000:.2f}".replace(".", ",")
+        return f"{sign}{raw}M"
+    if abs_value >= 1_000:
+        raw = f"{abs_value / 1_000:.2f}".replace(".", ",")
+        return f"{sign}{raw}k"
+    raw = f"{abs_value:.2f}".replace(".", ",")
+    return f"{sign}{raw}"
+
+
 def format_pct(value: float) -> str:
     return f"{100.0 * value:.2f}%"
 
@@ -1416,14 +2581,30 @@ def format_int(value: float | int) -> str:
     return f"{int(value):,}".replace(",", ".")
 
 
+def _apply_score_preset(name: str) -> None:
+    preset = SCORE_PRESETS.get(str(name).strip().lower())
+    if not preset:
+        return
+    st.session_state["score_drawdown_weight"] = float(preset["drawdown_weight"])
+    st.session_state["score_min_trades"] = int(preset["min_trades"])
+    st.session_state["score_penalty_missing"] = float(preset["penalty_missing"])
+
+
 def _init_session_state() -> None:
     st.session_state.setdefault("last_result", None)
     st.session_state.setdefault("turbo_job", None)
+    st.session_state.setdefault("turbo_loop_enabled", False)
+    st.session_state.setdefault("turbo_loop_pause_sec", 3)
+    st.session_state.setdefault("turbo_loop_max_cycles", 0)
+    st.session_state.setdefault("turbo_loop_cycles_done", 0)
     st.session_state.setdefault("symbol_default", "WINFUT")
     st.session_state.setdefault("timeframes_default", ["5m"])
     st.session_state.setdefault("strategies_default", list(STRATEGIES.keys()))
     st.session_state.setdefault("start_date_default", date(2025, 1, 17))
     st.session_state.setdefault("end_date_default", date(2026, 1, 16))
+    st.session_state.setdefault("score_drawdown_weight", float(SCORE_PRESETS["equilibrado"]["drawdown_weight"]))
+    st.session_state.setdefault("score_min_trades", int(SCORE_PRESETS["equilibrado"]["min_trades"]))
+    st.session_state.setdefault("score_penalty_missing", float(SCORE_PRESETS["equilibrado"]["penalty_missing"]))
 
 
 def _inject_compact_sidebar_css() -> None:

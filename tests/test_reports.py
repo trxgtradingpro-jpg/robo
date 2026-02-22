@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from src.reports import (
+    build_hourly_report,
     build_monthly_report,
     build_parameter_sensitivity_report,
     build_robustness_report,
@@ -73,3 +74,23 @@ def test_robustness_and_sensitivity_reports_have_core_fields() -> None:
     sensitivity = build_parameter_sensitivity_report(topk)
     assert not sensitivity.empty
     assert set(["parameter", "value", "avg_test_score"]).issubset(set(sensitivity.columns))
+
+
+def test_hourly_report_identifies_best_hour() -> None:
+    trades = pd.DataFrame(
+        {
+            "entry_time": pd.to_datetime(
+                [
+                    "2025-01-10 09:01:00",
+                    "2025-01-10 09:10:00",
+                    "2025-01-10 10:05:00",
+                    "2025-01-10 11:15:00",
+                ]
+            ),
+            "pnl_net": [100.0, -20.0, 50.0, -30.0],
+        }
+    )
+    hourly = build_hourly_report(trades)
+    assert not hourly.empty
+    assert int(hourly.iloc[0]["hour"]) == 9
+    assert float(hourly.iloc[0]["net_profit"]) == 80.0

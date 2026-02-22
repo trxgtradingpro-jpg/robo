@@ -13,6 +13,7 @@ import pandas as pd
 from .backtest_engine import BacktestConfig, default_trade_columns
 from .metrics import ScoreConfig, compute_metrics
 from .monitoring import AlertBus
+from .optimizer import generate_signals_with_time_filter
 from .risk import RiskLimits, RiskManager
 from .strategies import StrategySpec
 
@@ -89,15 +90,24 @@ def run_paper_engine(
         )
 
     ordered = df.sort_values("datetime").reset_index(drop=True).copy()
-    signals = strategy.generate_signals(ordered, strategy_params).reindex(ordered.index).fillna(0).astype(int)
+    signals = generate_signals_with_time_filter(ordered, strategy, strategy_params)
 
     bt = config.backtest_config
-    session_start = _parse_time(bt.session_start)
-    session_end = _parse_time(bt.session_end)
+    session_start_raw = strategy_params.get("session_start", bt.session_start)
+    session_end_raw = strategy_params.get("session_end", bt.session_end)
+    close_on_session_end = bool(strategy_params.get("close_on_session_end", bt.close_on_session_end))
+    max_consecutive_losses_per_day = int(
+        max(0, strategy_params.get("max_consecutive_losses_per_day", bt.max_consecutive_losses_per_day))
+    )
+    session_start = _parse_time(str(session_start_raw) if session_start_raw is not None else None)
+    session_end = _parse_time(str(session_end_raw) if session_end_raw is not None else None)
     stop_points = float(strategy_params.get("stop_points", bt.stop_points))
     take_points = float(strategy_params.get("take_points", bt.take_points))
     break_even_points = float(
         max(0.0, strategy_params.get("break_even_trigger_points", bt.break_even_trigger_points))
+    )
+    break_even_lock_points = float(
+        max(0.0, strategy_params.get("break_even_lock_points", bt.break_even_lock_points))
     )
 
     alert_bus = AlertBus()
@@ -112,6 +122,9 @@ def run_paper_engine(
     pending_entry: _PendingEntry | None = None
     trades: list[dict[str, object]] = []
     equity_rows: list[dict[str, object]] = []
+    active_day: Any = None
+    losses_consecutive_day = 0
+    day_blocked = False
 
     _emit(
         callback,
@@ -125,6 +138,11 @@ def run_paper_engine(
     for i in range(len(ordered)):
         row = ordered.iloc[i]
         dt: pd.Timestamp = pd.to_datetime(row["datetime"])
+        current_day = pd.Timestamp(dt).date()
+        if active_day is None or current_day != active_day:
+            active_day = current_day
+            losses_consecutive_day = 0
+            day_blocked = False
 
         if i % max(config.emit_every_bars, 1) == 0:
             _emit(
@@ -173,7 +191,7 @@ def run_paper_engine(
             and position is None
             and not risk_manager.state.halted
         ):
-            if _in_session(dt, session_start, session_end):
+            if (not day_blocked) and _in_session(dt, session_start, session_end):
                 if _allow_direction(pending_entry.direction, bt):
                     position = _open_position(
                         direction=pending_entry.direction,
@@ -192,7 +210,7 @@ def run_paper_engine(
         if position is not None:
             closed_trade: dict[str, object] | None = None
 
-            if bt.close_on_session_end and not _in_session(dt, session_start, session_end):
+            if close_on_session_end and not _in_session(dt, session_start, session_end):
                 closed_trade = _close_trade(
                     position=position,
                     exit_time=dt,
@@ -263,16 +281,29 @@ def run_paper_engine(
                         "cash": float(cash),
                     },
                 )
+                if pnl_net < 0:
+                    losses_consecutive_day += 1
+                elif pnl_net > 0:
+                    losses_consecutive_day = 0
+                if max_consecutive_losses_per_day > 0 and losses_consecutive_day >= max_consecutive_losses_per_day:
+                    day_blocked = True
             elif break_even_points > 0:
                 _maybe_arm_break_even(
                     position=position,
                     close_price=float(row["close"]),
                     trigger_points=break_even_points,
+                    lock_points=break_even_lock_points,
                 )
 
         # Close-generated signal.
         signal = int(signals.iloc[i])
-        if position is None and not risk_manager.state.halted and signal != 0 and _allow_direction(signal, bt):
+        if (
+            (not day_blocked)
+            and position is None
+            and not risk_manager.state.halted
+            and signal != 0
+            and _allow_direction(signal, bt)
+        ):
             if bt.entry_mode == "close_slippage":
                 if _in_session(dt, session_start, session_end):
                     position = _open_position(
@@ -504,17 +535,18 @@ def _check_hits(direction: int, low: float, high: float, stop_price: float, take
     return high >= stop_price, low <= take_price
 
 
-def _maybe_arm_break_even(position: _Position, close_price: float, trigger_points: float) -> None:
+def _maybe_arm_break_even(position: _Position, close_price: float, trigger_points: float, lock_points: float) -> None:
     trigger = float(max(0.0, trigger_points))
+    lock = float(max(0.0, lock_points))
     if trigger <= 0 or position.break_even_armed:
         return
     if position.direction > 0:
         if close_price >= position.entry_price + trigger:
-            position.stop_price = max(position.stop_price, position.entry_price)
+            position.stop_price = max(position.stop_price, position.entry_price + lock)
             position.break_even_armed = True
         return
     if close_price <= position.entry_price - trigger:
-        position.stop_price = min(position.stop_price, position.entry_price)
+        position.stop_price = min(position.stop_price, position.entry_price - lock)
         position.break_even_armed = True
 
 

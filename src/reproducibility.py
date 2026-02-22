@@ -10,6 +10,7 @@ import platform
 from pathlib import Path
 import sys
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 
@@ -40,9 +41,10 @@ def utc_now_iso() -> str:
 
 
 def build_run_id(prefix: str = "run") -> str:
-    """Generate deterministic-like run ID for artifacts."""
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return f"{prefix}_{ts}"
+    """Generate a high-uniqueness run ID for artifacts."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    nonce = uuid4().hex[:8]
+    return f"{prefix}_{ts}_{nonce}"
 
 
 def dataframe_sha256(df: pd.DataFrame) -> str:

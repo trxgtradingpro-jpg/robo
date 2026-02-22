@@ -78,6 +78,59 @@ def build_monthly_report(
     return pd.DataFrame(rows).sort_values("month").reset_index(drop=True)
 
 
+def build_hourly_report(trades: pd.DataFrame) -> pd.DataFrame:
+    """Build hour-of-day performance report to identify best operation windows."""
+    columns = [
+        "hour",
+        "trade_count",
+        "win_rate",
+        "net_profit",
+        "gross_profit",
+        "gross_loss",
+        "avg_trade",
+        "profit_factor",
+    ]
+    if trades.empty:
+        return pd.DataFrame(columns=columns)
+
+    local = trades.copy()
+    if "entry_time" in local.columns:
+        ts = pd.to_datetime(local["entry_time"], errors="coerce")
+    elif "exit_time" in local.columns:
+        ts = pd.to_datetime(local["exit_time"], errors="coerce")
+    else:
+        return pd.DataFrame(columns=columns)
+
+    local["hour"] = ts.dt.hour
+    local = local.dropna(subset=["hour"])
+    if local.empty or "pnl_net" not in local.columns:
+        return pd.DataFrame(columns=columns)
+
+    local["pnl_net"] = pd.to_numeric(local["pnl_net"], errors="coerce").fillna(0.0)
+    rows: list[dict[str, Any]] = []
+    for hour, grp in local.groupby("hour", sort=True):
+        pnl = grp["pnl_net"].astype(float)
+        wins = pnl[pnl > 0]
+        losses = pnl[pnl < 0]
+        gross_profit = float(wins.sum()) if not wins.empty else 0.0
+        gross_loss = float(losses.sum()) if not losses.empty else 0.0
+        profit_factor = abs(gross_profit / gross_loss) if gross_loss < 0 else (float("inf") if gross_profit > 0 else 0.0)
+        rows.append(
+            {
+                "hour": int(hour),
+                "trade_count": float(len(pnl)),
+                "win_rate": float((pnl > 0).mean()) if len(pnl) else 0.0,
+                "net_profit": float(pnl.sum()),
+                "gross_profit": gross_profit,
+                "gross_loss": gross_loss,
+                "avg_trade": float(pnl.mean()) if len(pnl) else 0.0,
+                "profit_factor": float(profit_factor) if np.isfinite(profit_factor) else 0.0,
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("net_profit", ascending=False).reset_index(drop=True)
+
+
 def build_robustness_report(
     window_results: pd.DataFrame,
     topk_test_results: pd.DataFrame,

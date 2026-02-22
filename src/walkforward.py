@@ -8,12 +8,20 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from .backtest_engine import BacktestConfig, run_backtest, with_stop_take
+from .backtest_engine import BacktestConfig, run_backtest
 from .metrics import ScoreConfig, compute_metrics
-from .optimizer import OptimizationCandidate, OptimizerConfig, optimize_strategy
+from .optimizer import (
+    OptimizationCandidate,
+    OptimizerConfig,
+    apply_hard_limits_to_metrics,
+    build_runtime_config_for_params,
+    generate_signals_with_time_filter,
+    optimize_strategy,
+)
 from .strategies import StrategySpec
 
 ProgressCallback = Callable[[dict[str, Any]], None]
+CheckpointCallback = Callable[["WalkForwardCheckpoint"], None]
 
 
 @dataclass(slots=True)
@@ -38,6 +46,21 @@ class WalkForwardResult:
     best_params_from_tests: dict[str, float | int | bool]
 
 
+@dataclass(slots=True)
+class WalkForwardCheckpoint:
+    """Partial walk-forward state emitted after each completed window."""
+
+    strategy_name: str
+    window_results: pd.DataFrame
+    topk_test_results: pd.DataFrame
+    oos_trades: pd.DataFrame
+    oos_equity: pd.DataFrame
+    windows_completed: int
+    total_windows: int
+    latest_oos_score: float
+    latest_oos_net_profit: float
+
+
 def run_walkforward(
     df: pd.DataFrame,
     strategy: StrategySpec,
@@ -45,6 +68,7 @@ def run_walkforward(
     optimizer_config: OptimizerConfig,
     wf_config: WalkForwardConfig,
     progress_callback: ProgressCallback | None = None,
+    checkpoint_callback: CheckpointCallback | None = None,
 ) -> WalkForwardResult:
     """Run full walk-forward for a strategy and return OOS artifacts."""
     date_index = pd.to_datetime(df["datetime"]).dt.date
@@ -130,17 +154,10 @@ def run_walkforward(
         test_end = max(test_days)
 
         for rank, candidate in enumerate(candidates, start=1):
-            test_cfg = with_stop_take(
-                base_config,
-                stop_points=float(candidate.params.get("stop_points", base_config.stop_points)),
-                take_points=float(candidate.params.get("take_points", base_config.take_points)),
-                break_even_points=float(
-                    candidate.params.get("break_even_trigger_points", base_config.break_even_trigger_points)
-                ),
-            )
+            test_cfg = build_runtime_config_for_params(base_config=base_config, params=candidate.params)
             test_result = run_backtest(
                 df=test_df,
-                signals=strategy.generate_signals(test_df, candidate.params),
+                signals=generate_signals_with_time_filter(test_df, strategy, candidate.params),
                 config=test_cfg,
                 strategy_name=strategy.name,
                 strategy_params=candidate.params,
@@ -150,6 +167,11 @@ def run_walkforward(
                 equity_curve=test_result.equity_curve,
                 initial_capital=test_cfg.initial_capital,
                 score_config=wf_config.score_config,
+            )
+            test_metrics = apply_hard_limits_to_metrics(
+                trades=test_result.trades,
+                metrics=test_metrics,
+                optimizer_config=optimizer_config,
             )
             topk_rows.append(
                 {
@@ -167,18 +189,11 @@ def run_walkforward(
             )
 
         # OOS stream uses best params from train only (no leak from test selection).
-        oos_cfg = with_stop_take(
-            base_config,
-            stop_points=float(best_train.params.get("stop_points", base_config.stop_points)),
-            take_points=float(best_train.params.get("take_points", base_config.take_points)),
-            break_even_points=float(
-                best_train.params.get("break_even_trigger_points", base_config.break_even_trigger_points)
-            ),
-        )
+        oos_cfg = build_runtime_config_for_params(base_config=base_config, params=best_train.params)
         oos_cfg.initial_capital = capital
         oos_result = run_backtest(
             df=test_df,
-            signals=strategy.generate_signals(test_df, best_train.params),
+            signals=generate_signals_with_time_filter(test_df, strategy, best_train.params),
             config=oos_cfg,
             strategy_name=strategy.name,
             strategy_params=best_train.params,
@@ -188,6 +203,11 @@ def run_walkforward(
             equity_curve=oos_result.equity_curve,
             initial_capital=capital,
             score_config=wf_config.score_config,
+        )
+        oos_metrics = apply_hard_limits_to_metrics(
+            trades=oos_result.trades,
+            metrics=oos_metrics,
+            optimizer_config=optimizer_config,
         )
         capital = oos_result.final_capital
 
@@ -224,8 +244,31 @@ def run_walkforward(
                 "capital_after_window": float(capital),
                 "oos_score": float(oos_metrics["score"]),
                 "oos_net_profit": float(oos_metrics["net_profit"]),
+                "oos_profit_factor": float(oos_metrics.get("profit_factor", 0.0)),
                 "oos_trade_count": float(oos_metrics["trade_count"]),
             },
+        )
+        _emit_checkpoint(
+            callback=checkpoint_callback,
+            checkpoint=WalkForwardCheckpoint(
+                strategy_name=strategy.name,
+                window_results=pd.DataFrame(window_rows),
+                topk_test_results=pd.DataFrame(topk_rows),
+                oos_trades=(
+                    pd.concat(oos_trades_parts, ignore_index=True)
+                    if oos_trades_parts
+                    else pd.DataFrame()
+                ),
+                oos_equity=(
+                    pd.concat(oos_equity_parts, ignore_index=True)
+                    if oos_equity_parts
+                    else pd.DataFrame(columns=["datetime", "equity", "cash"])
+                ),
+                windows_completed=int(window_id + 1),
+                total_windows=int(total_windows),
+                latest_oos_score=float(oos_metrics["score"]),
+                latest_oos_net_profit=float(oos_metrics["net_profit"]),
+            ),
         )
 
         window_id += 1
@@ -259,6 +302,7 @@ def run_walkforward(
             "total_windows": int(len(window_rows)),
             "final_score": float(consolidated["score"]),
             "net_profit": float(consolidated["net_profit"]),
+            "profit_factor": float(consolidated.get("profit_factor", 0.0)),
             "trade_count": float(consolidated["trade_count"]),
         },
     )
@@ -298,3 +342,12 @@ def _emit(callback: ProgressCallback | None, event: dict[str, Any]) -> None:
     if callback is None:
         return
     callback(event)
+
+
+def _emit_checkpoint(
+    callback: CheckpointCallback | None,
+    checkpoint: WalkForwardCheckpoint,
+) -> None:
+    if callback is None:
+        return
+    callback(checkpoint)

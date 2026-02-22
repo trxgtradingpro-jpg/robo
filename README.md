@@ -2,7 +2,7 @@
 
 Backtesting local para WINFUT com:
 - leitura de CSV do Profit (multi-timeframe),
-- tres estrategias (`ema_pullback`, `breakout_range`, `scalp_break_even`),
+- quatro estrategias (`ema_pullback`, `breakout_range`, `scalp_break_even`, `trx_htsl`),
 - custos/slippage,
 - fechamento forcado de posicoes no fim da sessao (padrao `17:00`),
 - slippage/custo dinamicos por volatilidade da barra (opcional),
@@ -107,6 +107,62 @@ python -m src.cli ^
   --verbose-progress
 ```
 
+Exemplo com limites globais e busca de melhores horarios:
+
+```bash
+python -m src.cli ^
+  --symbol WINFUT ^
+  --timeframes 5m ^
+  --strategies scalp_break_even ^
+  --start 2025-01-17 --end 2026-02-19 ^
+  --samples 250 --top-k 10 ^
+  --max-stop-points 250 ^
+  --max-daily-loss 1200 ^
+  --max-drawdown-pct-hard 12 ^
+  --optimize-hours --hour-start-min 9 --hour-start-max 14 --hour-end-min 11 --hour-end-max 18
+```
+
+Exemplo TRX HTSL:
+
+```bash
+python -m src.cli ^
+  --symbol WINFUT ^
+  --timeframes 5m ^
+  --strategies trx_htsl ^
+  --start 2025-02-08 --end 2026-03-21 ^
+  --samples 300 --top-k 10 ^
+  --max-stop-points 350 ^
+  --max-daily-loss 2000 ^
+  --max-drawdown-pct-hard 15 ^
+  --verbose-progress
+```
+
+Paridade TRX vs Profit (parametros fixos NTSL em 5m):
+
+```bash
+python -m src.trx_profit_cli ^
+  --symbol WINFUT ^
+  --timeframe 5m ^
+  --start 2025-02-19 --end 2026-02-19 ^
+  --initial-capital 193620 ^
+  --contracts 5 ^
+  --point-value 0.2 ^
+  --entry-model next_open ^
+  --session-start 09:00 --session-end 17:40 ^
+  --outputs outputs_parity
+```
+
+Para comparar direto com CSV do Profit:
+
+```bash
+python -m src.trx_profit_cli ^
+  --symbol WINFUT ^
+  --timeframe 5m ^
+  --start 2025-02-19 --end 2026-02-19 ^
+  --contracts 5 ^
+  --profit-ops "C:/caminho/operacoes_profit.csv"
+```
+
 ### Paper Trading (Fase 2)
 
 Replay event-driven candle a candle com risco operacional e kill switch:
@@ -132,6 +188,7 @@ Observacao:
 - para desativar, use `--no-close-on-session-end`.
 - a estrategia `scalp_break_even` usa `stop_points`, `take_points` e `break_even_trigger_points` (trava no 0x0).
 - o modo evolutivo usa banco de parametros em `outputs/<SIMBOLO>/<TF>/params_bank_<TF>_<estrategia>.jsonl`.
+- o arquivo `hourly_<timeframe>_<strategy>.csv` mostra as melhores horas para operar.
 
 ### Modo visual (tempo real)
 
@@ -148,6 +205,7 @@ No painel lateral:
 - ative `Modo turbo real (subprocesso)` para executar em processo separado sem travar a UI;
 - use `Parar turbo` para interromper o processo em execucao.
 - ajuste `Turbo step treino (N barras)` para acelerar a otimizacao (N>1 usa downsample no treino).
+- ative `Loop turbo continuo` para repetir automaticamente novas execucoes; use `Loop max ciclos` para limitar.
 
 Abas disponiveis no painel:
 - `Resumo`
@@ -158,23 +216,56 @@ Abas disponiveis no painel:
 - `Robustez` (alertas e sensibilidade de parametros)
 
 No modo turbo, logs de progresso aparecem no painel e o resultado e carregado automaticamente ao fim.
+Durante a execucao, o dashboard mostra `Ranking em Tempo Real` com todas as estrategias (pendente/em andamento/concluida), ordenadas da melhor para pior.
+Ao clicar em `Parar turbo`, o sistema pede parada graciosa e salva checkpoint parcial por estrategia/janela:
+- `checkpoint_<timeframe>_<strategy>.json`
+- `trades_<timeframe>_<strategy>.csv` (parcial)
+- `walkforward_windows_<timeframe>_<strategy>.csv` (parcial)
+- `walkforward_topk_<timeframe>_<strategy>.csv` (parcial)
+- `equity_curve_<timeframe>_<strategy>.csv` (parcial)
+
+### Validar paridade com Profit
+
+Para checar se os trades do robo batem com o relatorio de Operacoes do Profit:
+
+```bash
+python -m src.compare_profit_cli ^
+  --robot-trades "outputs/WINFUT/5m/trades_5m_trx_htsl.csv" ^
+  --profit-ops "C:/caminho/operacoes_profit.csv" ^
+  --time-tolerance-sec 300 ^
+  --pnl-tolerance 5 ^
+  --price-tolerance 5 ^
+  --output-dir "outputs_compare/trx_htsl_5m"
+```
+
+Arquivos gerados:
+- `compare_summary.json`
+- `compare_matched.csv`
+- `compare_only_robot.csv`
+- `compare_only_profit.csv`
 
 ## Saida
 
 Para cada timeframe em `outputs/WINFUT/<timeframe>/`:
 - `summary_<timeframe>.csv`
+- `summary_<timeframe>_<run_id>_c<cycle>.csv` (snapshot versionado, sem sobrescrever)
 - `best_params_<timeframe>.json`
+- `best_params_<timeframe>_<run_id>_c<cycle>.json` (snapshot versionado)
 - `data_quality_<timeframe>.json`
 - `trades_<timeframe>_<strategy>.csv`
 - `walkforward_windows_<timeframe>_<strategy>.csv`
 - `walkforward_topk_<timeframe>_<strategy>.csv`
 - `equity_curve_<timeframe>_<strategy>.csv`
 - `monthly_<timeframe>_<strategy>.csv`
+- `hourly_<timeframe>_<strategy>.csv`
 - `sensitivity_<timeframe>_<strategy>.csv`
 - `robustness_<timeframe>_<strategy>.json`
 - `equity_<timeframe>_<strategy>.png`
 - `equity_curve_<timeframe>_best.csv`
+- `equity_curve_<timeframe>_best_<run_id>_c<cycle>.csv`
 - `equity_<timeframe>_best.png`
+- `equity_<timeframe>_best_<run_id>_c<cycle>.png`
+- `best_history_<timeframe>.csv` (historico acumulado dos melhores por execucao)
 
 Na pasta `outputs/WINFUT/`:
 - `run_manifest_<run_id>.json` (reprodutibilidade)

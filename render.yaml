@@ -1,0 +1,41 @@
+services:
+  - type: worker
+    name: robo-all-strategies-worker
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash scripts/render/run_all_strategies_loop.sh
+    autoDeploy: true
+    disk:
+      name: robo-data
+      mountPath: /var/data
+      sizeGB: 10
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.11"
+      - key: OUTPUTS_DIR
+        value: /var/data/outputs_master
+      - key: DATA_ROOT
+        value: data
+      - key: START_DATE
+        value: "2025-02-19"
+      - key: END_DATE
+        value: "2026-02-19"
+      - key: TIMEFRAMES
+        value: "5m"
+      - key: TRAIN_DAYS
+        value: "120"
+      - key: TEST_DAYS
+        value: "30"
+      - key: SAMPLES
+        value: "100"
+      - key: TOP_K
+        value: "10"
+      - key: PARAM_BANK_TOP
+        value: "70"
+      - key: PROGRESS_PRINT_EVERY
+        value: "3"
+      - key: LOOP_SLEEP_SEC
+        value: "10"
+      - key: STOP_FILE
+        value: /var/data/outputs_master/STOP_RENDER_ALL
